@@ -27,6 +27,7 @@ DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 _EMBEDDER_CACHE: dict[str, SentenceTransformer] = {}
 _PROJECTION_CACHE: dict[tuple[int, int, int], np.ndarray] = {}
+_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
 
 def _random_tension() -> float:
@@ -76,6 +77,27 @@ def embed_to_hd(
 def pack_bipolar(vector: np.ndarray) -> np.ndarray:
     bits = ((vector + 1.0) / 2.0).astype(np.uint8)
     return np.packbits(bits, axis=None)
+
+
+def packed_cosine_similarity_many(
+    packed_ref: np.ndarray,
+    packed_others: np.ndarray,
+    dim: int,
+) -> np.ndarray:
+    xor = np.bitwise_xor(packed_others, packed_ref)
+    counts = _POPCOUNT_LUT[xor].sum(axis=1).astype(np.float32)
+    return 1.0 - (2.0 * counts / dim)
+
+
+def packed_cosine_similarity_edges(
+    packed_matrix: np.ndarray,
+    src_idx: np.ndarray,
+    dst_idx: np.ndarray,
+    dim: int,
+) -> np.ndarray:
+    xor = np.bitwise_xor(packed_matrix[src_idx], packed_matrix[dst_idx])
+    counts = _POPCOUNT_LUT[xor].sum(axis=1).astype(np.float32)
+    return 1.0 - (2.0 * counts / dim)
 
 
 def bind_token_to_node(node: "Node", hd_token: np.ndarray, alpha: float = 0.1) -> None:
@@ -232,6 +254,12 @@ class ResonanceGraph:
         for edge in self.edges:
             self.adj_out[edge.src].append(edge)
             self.adj_in[edge.dst].append(edge)
+        self._build_edge_arrays()
+
+    def _build_edge_arrays(self) -> None:
+        self._edge_src = np.array([edge.src for edge in self.edges], dtype=np.int32)
+        self._edge_dst = np.array([edge.dst for edge in self.edges], dtype=np.int32)
+        self._edge_readonly = np.array([edge.read_only for edge in self.edges], dtype=bool)
 
     def _build_sim_index(self) -> None:
         matrix = np.vstack([node.vector for node in self.nodes]).astype(np.float32)
@@ -282,26 +310,28 @@ class ResonanceGraph:
             if not in_edges:
                 continue
             edge_map = {edge.src: edge for edge in in_edges}
-            vec_i = self.nodes[i].vector
-            norm_i = float(np.linalg.norm(vec_i))
-            if norm_i <= EPS:
-                continue
-            vec_i_norm = vec_i / norm_i
-            total = 0.0
+            packed_neighbors: list[np.ndarray] = []
+            tensions: list[float] = []
+            activations: list[float] = []
             for j in neighbors:
                 edge = edge_map.get(j)
                 if edge is None:
                     continue
-                vec_j = self.nodes[j].vector
-                norm_j = float(np.linalg.norm(vec_j))
-                if norm_j <= EPS:
-                    continue
-                vec_j_norm = vec_j / norm_j
-                sim = float(np.dot(vec_i_norm, vec_j_norm))
-                if sim <= 0.0:
-                    continue
-                total += edge.tension * self.nodes[j].activation * sim
-            incoming_signal[i] = total
+                packed_neighbors.append(self.nodes[j]._packed)
+                tensions.append(edge.tension)
+                activations.append(self.nodes[j].activation)
+            if not packed_neighbors:
+                continue
+            packed_mat = np.vstack(packed_neighbors)
+            sims = packed_cosine_similarity_many(
+                self.nodes[i]._packed,
+                packed_mat,
+                self.dim,
+            )
+            sims = np.maximum(0.0, sims)
+            incoming_signal[i] = float(
+                np.sum(np.asarray(tensions, dtype=np.float32) * np.asarray(activations, dtype=np.float32) * sims)
+            )
 
         def dA(activations: np.ndarray) -> np.ndarray:
             deriv = np.zeros_like(activations, dtype=np.float32)
@@ -336,48 +366,57 @@ class ResonanceGraph:
     def local_learn(self) -> None:
         if self.locked:
             return
+        activations = np.array([node.activation for node in self.nodes], dtype=np.float32)
+        ema = np.array([node.ema for node in self.nodes], dtype=np.float32)
+        ema_next = ema.copy()
+        if self.n_nodes > 1:
+            ema_next[1:] = EMA_DECAY * ema[1:] + (1.0 - EMA_DECAY) * activations[1:]
 
-        deltas: dict[Edge, float] = defaultdict(float)
-        def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-            if denom <= EPS:
-                return 0.0
-            return float(np.dot(a, b) / denom)
+        friction = np.abs(activations - ema_next)
+        friction_mask = friction >= FRICTION_THRESHOLD
+        if self.n_nodes > 0:
+            friction_mask[0] = False
 
-        for node in self.nodes:
-            if node.is_root:
-                continue
-            node.ema = EMA_DECAY * node.ema + (1.0 - EMA_DECAY) * node.activation
-            friction = abs(node.activation - node.ema)
-            if friction < FRICTION_THRESHOLD:
-                continue
-            node_vec = node.vector
-            for edge in self.adj_in.get(node.idx, []):
-                if edge.read_only:
-                    continue
-                src_act = self.nodes[edge.src].activation
-                if src_act < SRC_ACT_THRESHOLD:
-                    continue
-                sim = cosine_sim(self.nodes[edge.src].vector, node_vec)
-                if sim < SIM_GATE:
-                    continue
-                delta = self.lr * (
-                    node.activation * src_act - (node.activation ** 2) * edge.tension
-                )
-                deltas[edge] += delta
+        src_idx = self._edge_src
+        dst_idx = self._edge_dst
+        read_only = self._edge_readonly
+        tensions = np.array([edge.tension for edge in self.edges], dtype=np.float32)
 
-        for edge, delta in deltas.items():
-            edge.tension = float(np.clip(edge.tension + delta, MIN_TENSION, 1.0))
+        src_act = activations[src_idx]
+        dst_act = activations[dst_idx]
 
-        for node in self.nodes:
-            if node.is_root:
-                continue
-            incoming_edges = self.adj_in.get(node.idx, [])
-            total = sum(edge.tension for edge in incoming_edges)
-            if total <= EPS:
-                continue
-            for edge in incoming_edges:
-                edge.tension = max(MIN_TENSION, edge.tension / total)
+        packed_matrix = np.vstack([node._packed for node in self.nodes])
+        sim = packed_cosine_similarity_edges(packed_matrix, src_idx, dst_idx, self.dim)
+
+        active_mask = (
+            friction_mask[dst_idx]
+            & (src_act >= SRC_ACT_THRESHOLD)
+            & (~read_only)
+            & (sim >= SIM_GATE)
+        )
+
+        deltas = np.where(
+            active_mask,
+            self.lr * (dst_act * src_act - dst_act * dst_act * tensions),
+            0.0,
+        )
+
+        tension_next = np.clip(tensions + deltas, MIN_TENSION, 1.0)
+        totals = np.bincount(dst_idx, weights=tension_next, minlength=self.n_nodes).astype(
+            np.float32
+        )
+        if self.n_nodes > 0:
+            totals[0] = 0.0
+        scale = np.ones_like(totals)
+        valid = totals > EPS
+        scale[valid] = 1.0 / totals[valid]
+        tension_norm = np.maximum(tension_next * scale[dst_idx], MIN_TENSION)
+
+        for edge, tension in zip(self.edges, tension_norm):
+            edge.tension = float(tension)
+
+        for idx in range(1, self.n_nodes):
+            self.nodes[idx].ema = float(ema_next[idx])
 
 
 class OverrideInterceptor:
