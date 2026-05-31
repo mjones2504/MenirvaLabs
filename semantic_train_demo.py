@@ -89,8 +89,16 @@ def build_corpus(per_topic: int = 20, seed: int = 0) -> List[Tuple[str, str]]:
 
 
 def embed_sentences(sentences: Iterable[str]) -> np.ndarray:
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    embeddings = model.encode(list(sentences), convert_to_numpy=True, normalize_embeddings=True)
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=device)
+    sentences_list = list(sentences)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        pool = model.start_multi_process_pool()
+        embeddings = model.encode_multi_process(sentences_list, pool, normalize_embeddings=True)
+        model.stop_multi_process_pool(pool)
+    else:
+        embeddings = model.encode(sentences_list, convert_to_numpy=True, normalize_embeddings=True)
     return embeddings.astype(np.float32)
 
 

@@ -34,9 +34,11 @@ def _random_tension() -> float:
 
 
 def get_embedder(model_name: str) -> SentenceTransformer:
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     embedder = _EMBEDDER_CACHE.get(model_name)
     if embedder is None:
-        embedder = SentenceTransformer(model_name)
+        embedder = SentenceTransformer(model_name, device=device)
         _EMBEDDER_CACHE[model_name] = embedder
     return embedder
 
