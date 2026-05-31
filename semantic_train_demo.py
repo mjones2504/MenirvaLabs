@@ -95,7 +95,7 @@ def embed_sentences(sentences: Iterable[str]) -> np.ndarray:
     sentences_list = list(sentences)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         pool = model.start_multi_process_pool()
-        embeddings = model.encode_multi_process(sentences_list, pool, normalize_embeddings=True)
+        embeddings = model.encode(sentences_list, pool=pool, convert_to_numpy=True, normalize_embeddings=True)
         model.stop_multi_process_pool(pool)
     else:
         embeddings = model.encode(sentences_list, convert_to_numpy=True, normalize_embeddings=True)
